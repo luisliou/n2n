@@ -144,6 +144,49 @@ static const char* transop_str(enum n2n_transform tr) {
 
 /* ************************************** */
 
+/** Destination 01:00:5E:00:00:00 - 01:00:5E:7F:FF:FF is multicast ethernet.
+ */
+static int is_ethMulticast(const void * buf, size_t bufsize) {
+  int retval = 0;
+
+  /* Match 01:00:5E:00:00:00 - 01:00:5E:7F:FF:FF */
+  if(bufsize >= sizeof(ether_hdr_t)) {
+      /* copy to aligned memory */
+      ether_hdr_t eh;
+      memcpy(&eh, buf, sizeof(ether_hdr_t));
+
+      if((0x01 == eh.dhost[0]) &&
+	 (0x00 == eh.dhost[1]) &&
+	 (0x5E == eh.dhost[2]) &&
+	 (0 == (0x80 & eh.dhost[3])))
+	  retval = 1; /* This is an ethernet multicast packet [RFC1112]. */
+    }
+
+  return retval;
+}
+
+/* ************************************** */
+
+/** Destination MAC 33:33:0:00:00:00 - 33:33:FF:FF:FF:FF is reserved for IPv6
+ *  neighbour discovery.
+ */
+static int is_ip6_discovery(const void * buf, size_t bufsize) {
+  int retval = 0;
+
+  if(bufsize >= sizeof(ether_hdr_t)) {
+      /* copy to aligned memory */
+      ether_hdr_t eh;
+
+      memcpy(&eh, buf, sizeof(ether_hdr_t));
+
+      if((0x33 == eh.dhost[0]) && (0x33 == eh.dhost[1]))
+	  retval = 1; /* This is an IPv6 multicast packet [RFC2464]. */
+    }
+  return retval;
+}
+
+/* ************************************** */
+
 /** Initialise an edge to defaults.
  *
  *  This also initialises the NULL transform operation opstruct.
@@ -384,9 +427,43 @@ static void register_with_new_peer(n2n_edge_t * eee,
 	       HASH_COUNT(eee->pending_peers));
 
     /* trace Sending REGISTER */
-    send_register(eee, &(scan->sock), mac);
     if(from_supernode) {
+	  /* UDP NAT hole punching through supernode. Send to peer first(punch local UDP hole)
+       * and then ask supernode to forward. Supernode then ask peer to ack. Some nat device
+       * drop and block ports with incoming UDP packet if out-come traffic does not exist.
+       * So we can alternatively set TTL so that the packet sent to peer never really reaches
+       * The register_ttl is basically nat level + 1. Set it to 1 means host like DMZ.
+       */
+      if (eee->conf.register_ttl == 1) {
+        /* We are DMZ host or port is directly accessible. Just let peer to send back the ack */
+#ifndef WIN32
+      } else if(eee->conf.register_ttl > 1) {
+        /* Setting register_ttl usually implies that the edge knows the internal net topology
+         * clearly, we can apply aggressive port prediction to support incoming Symmetric NAT
+         */
+        int curTTL = 0;
+        socklen_t lenTTL = sizeof(int);
+        n2n_sock_t sock = scan->sock;
+        int alter = 16; /* TODO: set by command line or more reliable prediction method */
+
+        getsockopt(eee->udp_sock, IPPROTO_IP, IP_TTL, (void *)(char *)&curTTL, &lenTTL);
+        setsockopt(eee->udp_sock, IPPROTO_IP, IP_TTL,
+                  (void *)(char *)&eee->conf.register_ttl,
+                  sizeof(eee->conf.register_ttl));
+        for (; alter > 0; alter--, sock.port++)
+        {
+          send_register(eee, &sock, mac);
+        }
+        setsockopt(eee->udp_sock, IPPROTO_IP, IP_TTL, (void *)(char *)&curTTL, sizeof(curTTL));
+#endif
+      } else { /* eee->conf.register_ttl <= 0 */
+        /* Normal STUN */
+        send_register(eee, &(scan->sock), mac);
+      }
       send_register(eee, &(eee->supernode), mac);
+    } else {
+      /* P2P register, send directly */
+      send_register(eee, &(scan->sock), mac);
     }
 
     register_with_local_peers(eee);
@@ -869,14 +946,20 @@ static int handle_PACKET(n2n_edge_t * eee,
     rx_transop_id = (n2n_transform_t)pkt->transform;
 
     if(rx_transop_id == eee->conf.transop_id) {
+        uint8_t is_multicast;
 	eth_payload = decodebuf;
 	eh = (ether_hdr_t*)eth_payload;
 	eth_size = eee->transop.rev(&eee->transop,
 						    eth_payload, N2N_PKT_BUF_SIZE,
 						    payload, psize, pkt->srcMac);
 	++(eee->transop.rx_cnt); /* stats */
+	is_multicast = (is_ip6_discovery(eth_payload, eth_size) || is_ethMulticast(eth_payload, eth_size));
 
-	if(!(eee->conf.allow_routing)) {
+	if(eee->conf.drop_multicast && is_multicast) {
+	  traceEvent(TRACE_INFO, "Dropping RX multicast");
+	  return(-1);
+        } else if((!eee->conf.allow_routing) && (!is_multicast)) {
+	  /* Check if it is a routed packet */
 	  if((ntohs(eh->type) == 0x0800) && (eth_size >= ETH_FRAMESIZE + IP4_MIN_SIZE)) {
 	    uint32_t *dst = (uint32_t*)&eth_payload[ETH_FRAMESIZE + IP4_DSTOFFSET];
 	    u_int8_t *dst_mac = (u_int8_t*)eth_payload;
@@ -1050,49 +1133,6 @@ static void readFromMgmtSocket(n2n_edge_t * eee, int * keep_running) {
 
   /* sendlen = */ sendto(eee->udp_mgmt_sock, udp_buf, msg_len, 0/*flags*/,
 			 (struct sockaddr *)&sender_sock, sizeof(struct sockaddr_in));
-}
-
-/* ************************************** */
-
-/** Destination MAC 33:33:0:00:00:00 - 33:33:FF:FF:FF:FF is reserved for IPv6
- *  neighbour discovery.
- */
-static int is_ip6_discovery(const void * buf, size_t bufsize) {
-  int retval = 0;
-
-  if(bufsize >= sizeof(ether_hdr_t)) {
-      /* copy to aligned memory */
-      ether_hdr_t eh;
-
-      memcpy(&eh, buf, sizeof(ether_hdr_t));
-
-      if((0x33 == eh.dhost[0]) && (0x33 == eh.dhost[1]))
-	  retval = 1; /* This is an IPv6 multicast packet [RFC2464]. */
-    }
-  return retval;
-}
-
-/* ************************************** */
-
-/** Destination 01:00:5E:00:00:00 - 01:00:5E:7F:FF:FF is multicast ethernet.
- */
-static int is_ethMulticast(const void * buf, size_t bufsize) {
-  int retval = 0;
-
-  /* Match 01:00:5E:00:00:00 - 01:00:5E:7F:FF:FF */
-  if(bufsize >= sizeof(ether_hdr_t)) {
-      /* copy to aligned memory */
-      ether_hdr_t eh;
-      memcpy(&eh, buf, sizeof(ether_hdr_t));
-
-      if((0x01 == eh.dhost[0]) &&
-	 (0x00 == eh.dhost[1]) &&
-	 (0x5E == eh.dhost[2]) &&
-	 (0 == (0x80 & eh.dhost[3])))
-	  retval = 1; /* This is an ethernet multicast packet [RFC1112]. */
-    }
-
-  return retval;
 }
 
 /* ************************************** */
@@ -1336,7 +1376,7 @@ static void readFromTAPSocket(n2n_edge_t * eee) {
 	  )
 	 )
         {
-	  traceEvent(TRACE_DEBUG, "Dropping multicast");
+	  traceEvent(TRACE_INFO, "Dropping TX multicast");
         }
       else
         {
@@ -1460,6 +1500,16 @@ static void readFromIPSocket(n2n_edge_t * eee, int in_sock) {
 
 	  if(is_valid_peer_sock(&pkt.sock))
 	    orig_sender = &(pkt.sock);
+
+	  if(!from_supernode) {
+	    /* This is a P2P packet from the peer. We purge a pending
+	     * registration towards the possibly nat-ted peer address as we now have
+	     * a valid channel. We still use check_peer_registration_needed in
+	     * handle_PACKET to double check this.
+	     */
+	    traceEvent(TRACE_DEBUG, "Got P2P packet");
+	    find_and_remove_peer(&eee->pending_peers, pkt.srcMac);
+	  }
 
 	  traceEvent(TRACE_INFO, "Rx PACKET from %s (sender=%s) [%u B]",
 		     sock_to_cstr(sockbuf1, &sender),
